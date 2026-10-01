@@ -19,37 +19,6 @@
 
 ---
 
-## Previews
-
-<div align="center">
-  <table>
-    <tr>
-      <td align="center"><b>Volume Control (Active)</b></td>
-      <td align="center"><b>Muted State</b></td>
-    </tr>
-    <tr>
-      <td><img src="assets/hud_volume.png" width="340" alt="Volume HUD"></td>
-      <td><img src="assets/hud_muted.png" width="340" alt="Muted HUD"></td>
-    </tr>
-    <tr>
-      <td align="center"><b>Media Playing (with Waveform)</b></td>
-      <td align="center"><b>Media Paused</b></td>
-    </tr>
-    <tr>
-      <td><img src="assets/hud_playing.png" width="340" alt="Playing HUD"></td>
-      <td><img src="assets/hud_paused.png" width="340" alt="Paused HUD"></td>
-    </tr>
-    <tr>
-      <td colspan="2" align="center"><b>Track Skip (Directional Kick)</b></td>
-    </tr>
-    <tr>
-      <td colspan="2" align="center"><img src="assets/hud_next.png" width="340" alt="Skip HUD"></td>
-    </tr>
-  </table>
-</div>
-
----
-
 ## Why another OSD?
 
 Most volume notification tools on Linux either use generic desktop notifications (which feel sluggish and pop up in random screen corners), or re-launch an entire script on every keypress (introducing 200–300ms of lag).
