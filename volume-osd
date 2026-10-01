@@ -1,0 +1,1017 @@
+#!/usr/bin/env python3
+"""
+Volume & Media OSD for Linux / IceWM / antiX
+Sleek, fluid, animated volume & media player indicator HUD with glassmorphic styling,
+dynamic multi-color gradients, vector icon springs/bounces, animated audio waves,
+directional skip animations, and zero-latency UNIX socket IPC. Supports both MPRIS
+players (browsers, Spotify, VLC) and classic XMMS.
+"""
+
+import sys
+import os
+import re
+import socket
+import subprocess
+import threading
+import queue
+import time
+import math
+
+SOCKET_PATH = f"/tmp/volume_osd_{os.getuid()}.sock"
+DEFAULT_STEP = 5
+
+# ─── Audio Helpers ────────────────────────────────────────────────────────────
+
+def parse_amixer_output(text: str):
+    """Extract volume percentage (0-100) and mute state from amixer output."""
+    vol_match = re.search(r'\[(\d+)%\]', text)
+    mute_match = re.search(r'\[(on|off)\]', text)
+    vol = int(vol_match.group(1)) if vol_match else None
+    muted = (mute_match.group(1) == 'off') if mute_match else None
+    return vol, muted
+
+def query_system_volume():
+    """Query current volume and mute state via amixer."""
+    try:
+        out = subprocess.check_output(['amixer', 'sget', 'Master'], text=True, stderr=subprocess.DEVNULL)
+        vol, muted = parse_amixer_output(out)
+        if vol is not None and muted is not None:
+            return vol, muted
+    except Exception:
+        pass
+    try:
+        out = subprocess.check_output(['wpctl', 'get-volume', '@DEFAULT_AUDIO_SINK@'], text=True, stderr=subprocess.DEVNULL)
+        m = re.search(r'Volume:\s+([\d\.]+)(\s+\[MUTED\])?', out)
+        if m:
+            vol = int(round(float(m.group(1)) * 100))
+            muted = bool(m.group(2))
+            return vol, muted
+    except Exception:
+        pass
+    return 50, False
+
+def apply_system_volume(action: str, step: int = DEFAULT_STEP):
+    """Apply volume change via amixer and return (vol, muted)."""
+    try:
+        if action == 'up':
+            cmd = ['amixer', 'sset', 'Master', f'{step}%+', 'unmute']
+        elif action == 'down':
+            cmd = ['amixer', 'sset', 'Master', f'{step}%-']
+        elif action == 'mute':
+            cmd = ['amixer', 'sset', 'Master', 'toggle']
+        elif action == 'set':
+            cmd = ['amixer', 'sset', 'Master', f'{max(0, min(100, step))}%']
+        else:
+            cmd = ['amixer', 'sget', 'Master']
+        out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+        vol, muted = parse_amixer_output(out)
+        if vol is not None and muted is not None:
+            return vol, muted
+    except Exception:
+        pass
+    return query_system_volume()
+
+
+# ─── Media Player Helpers (XMMS & MPRIS) ──────────────────────────────────────
+
+_xmms_lib = None
+_xmms_checked = False
+
+def get_xmms_lib():
+    global _xmms_lib, _xmms_checked
+    if _xmms_checked:
+        return _xmms_lib
+    _xmms_checked = True
+    for libname in ('libxmms.so.1', 'libxmms.so', 'libxmms.so.1.3.1'):
+        try:
+            import ctypes
+            lib = ctypes.CDLL(libname)
+            lib.xmms_remote_is_running.restype = ctypes.c_int
+            lib.xmms_remote_is_running.argtypes = [ctypes.c_int]
+            lib.xmms_remote_is_playing.restype = ctypes.c_int
+            lib.xmms_remote_is_playing.argtypes = [ctypes.c_int]
+            lib.xmms_remote_is_paused.restype = ctypes.c_int
+            lib.xmms_remote_is_paused.argtypes = [ctypes.c_int]
+            lib.xmms_remote_play_pause.restype = None
+            lib.xmms_remote_play_pause.argtypes = [ctypes.c_int]
+            lib.xmms_remote_playlist_next.restype = None
+            lib.xmms_remote_playlist_next.argtypes = [ctypes.c_int]
+            lib.xmms_remote_playlist_prev.restype = None
+            lib.xmms_remote_playlist_prev.argtypes = [ctypes.c_int]
+            lib.xmms_remote_get_playlist_pos.restype = ctypes.c_int
+            lib.xmms_remote_get_playlist_pos.argtypes = [ctypes.c_int]
+            lib.xmms_remote_get_playlist_title.restype = ctypes.c_char_p
+            lib.xmms_remote_get_playlist_title.argtypes = [ctypes.c_int, ctypes.c_int]
+            _xmms_lib = lib
+            break
+        except Exception:
+            continue
+    return _xmms_lib
+
+def is_xmms_running() -> bool:
+    lib = get_xmms_lib()
+    if lib:
+        try:
+            return bool(lib.xmms_remote_is_running(0))
+        except Exception:
+            pass
+    try:
+        out = subprocess.check_output(['pgrep', '-x', 'xmms'], stderr=subprocess.DEVNULL)
+        return bool(out.strip())
+    except Exception:
+        return False
+
+def find_xmms_window():
+    """Locate XMMS main window ID and extract current song title."""
+    try:
+        out = subprocess.check_output(['xdotool', 'search', '--class', 'xmms'], text=True, stderr=subprocess.DEVNULL)
+        for wid in out.strip().splitlines():
+            wid = wid.strip()
+            if not wid:
+                continue
+            try:
+                name = subprocess.check_output(['xdotool', 'getwindowname', wid], text=True, stderr=subprocess.DEVNULL).strip()
+                if 'XMMS' in name and 'Playlist' not in name and 'Equalizer' not in name:
+                    title = name
+                    m = re.match(r'^XMMS\s*-\s*(?:\d+\.\s*)?(.*?)(?:\s*\(\d+:\d+\))?$', name)
+                    if m:
+                        title = m.group(1).strip()
+                    elif name == 'XMMS':
+                        title = 'XMMS Player'
+                    return wid, title
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return None, None
+
+def get_xmms_title() -> str:
+    lib = get_xmms_lib()
+    if lib:
+        try:
+            pos = lib.xmms_remote_get_playlist_pos(0)
+            raw = lib.xmms_remote_get_playlist_title(0, pos)
+            if raw:
+                t = raw.decode('utf-8', errors='replace').strip()
+                if t:
+                    return t
+        except Exception:
+            pass
+    wid, title = find_xmms_window()
+    return title or "XMMS Player"
+
+def get_mpris_status():
+    try:
+        out = subprocess.check_output(['playerctl', 'status'], text=True, stderr=subprocess.DEVNULL).strip().lower()
+        if out in ('playing', 'paused', 'stopped'):
+            return out
+    except Exception:
+        pass
+    return None
+
+def get_mpris_title() -> str:
+    try:
+        out = subprocess.check_output(['playerctl', 'metadata', 'title'], text=True, stderr=subprocess.DEVNULL).strip()
+        return out
+    except Exception:
+        return ""
+
+def mpris_toggle_and_wait(status_before: str):
+    expected_status = 'paused' if status_before == 'playing' else 'playing'
+    subprocess.run(['playerctl', 'play-pause'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    confirmed_status = expected_status
+    for _ in range(6):
+        time.sleep(0.02)
+        st = get_mpris_status()
+        if st and st != status_before:
+            confirmed_status = st
+            break
+    title = get_mpris_title()
+    return confirmed_status, title or "Browser Media"
+
+def query_media_state():
+    """Returns (state, title, player_type). state is 'playing', 'paused', or 'none'."""
+    if is_xmms_running():
+        lib = get_xmms_lib()
+        if lib:
+            try:
+                if lib.xmms_remote_is_playing(0):
+                    return 'playing', get_xmms_title(), 'xmms'
+                elif lib.xmms_remote_is_paused(0):
+                    return 'paused', get_xmms_title(), 'xmms'
+            except Exception:
+                pass
+        return 'unknown', get_xmms_title(), 'xmms'
+
+    st = get_mpris_status()
+    if st:
+        return st, (get_mpris_title() or "Browser Media"), 'mpris'
+
+    return 'none', "No Player Active", 'none'
+
+def toggle_media():
+    """Smart play-pause: controls active MPRIS player or XMMS player."""
+    # 1. If XMMS is playing, pause it
+    if is_xmms_running():
+        lib = get_xmms_lib()
+        if lib and lib.xmms_remote_is_playing(0):
+            lib.xmms_remote_play_pause(0)
+            time.sleep(0.04)
+            return 'paused', get_xmms_title()
+
+    # 2. If MPRIS is playing, pause it
+    mpris_st = get_mpris_status()
+    if mpris_st == 'playing':
+        return mpris_toggle_and_wait('playing')
+
+    # 3. If XMMS is running and paused, resume it
+    if is_xmms_running():
+        lib = get_xmms_lib()
+        if lib:
+            lib.xmms_remote_play_pause(0)
+            time.sleep(0.04)
+            return 'playing', get_xmms_title()
+        wid, xmms_title = find_xmms_window()
+        if wid:
+            subprocess.run(['xdotool', 'key', '--window', wid, 'c'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return 'playing', xmms_title or "XMMS Player"
+
+    # 4. If MPRIS is paused or stopped, resume it
+    if mpris_st in ('paused', 'stopped'):
+        return mpris_toggle_and_wait(mpris_st)
+
+    # 5. Generic fallback
+    return mpris_toggle_and_wait(mpris_st or 'unknown')
+
+def skip_media(forward: bool = True):
+    """Smart next/previous track for XMMS and MPRIS."""
+    if is_xmms_running():
+        lib = get_xmms_lib()
+        if lib:
+            try:
+                if forward:
+                    lib.xmms_remote_playlist_next(0)
+                else:
+                    lib.xmms_remote_playlist_prev(0)
+                time.sleep(0.06)
+                return 'playing', get_xmms_title()
+            except Exception:
+                pass
+        xmms_wid, _ = find_xmms_window()
+        if xmms_wid:
+            key = 'b' if forward else 'z'
+            subprocess.run(['xdotool', 'key', '--window', xmms_wid, key], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(0.06)
+            _, title = find_xmms_window()
+            return 'playing', title or "XMMS Player"
+
+    try:
+        cmd = ['playerctl', 'next' if forward else 'previous']
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.06)
+        title = get_mpris_title()
+        return 'playing', title or "Media Player"
+    except Exception:
+        pass
+    return 'playing', "Track Skipped"
+
+
+# ─── Client Mode (Fast IPC Trigger) ──────────────────────────────────────────
+
+def send_client_command(cmd_str: str) -> bool:
+    """Connect to daemon socket and send command string. Returns True if successful."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(0.6)
+    try:
+        s.connect(SOCKET_PATH)
+        s.sendall((cmd_str.strip() + "\n").encode("utf-8"))
+        s.close()
+        return True
+    except (FileNotFoundError, ConnectionRefusedError, socket.timeout, OSError):
+        return False
+
+def run_client():
+    args = sys.argv[1:]
+    cmd_str = " ".join(args) if args else "show"
+
+    if send_client_command(cmd_str):
+        return
+
+    # Daemon not running -> spawn it in background
+    script_path = os.path.abspath(__file__)
+    subprocess.Popen(
+        [sys.executable, script_path, "--daemon"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True
+    )
+
+    deadline = time.time() + 0.45
+    while time.time() < deadline:
+        time.sleep(0.03)
+        if send_client_command(cmd_str):
+            return
+
+    # Fallback direct execution
+    action = args[0].lower() if args else "show"
+    if action in ('play-pause', 'play', 'pause', 'toggle-media'):
+        toggle_media()
+    elif action in ('next', 'prev'):
+        skip_media(forward=(action == 'next'))
+    else:
+        step = int(args[1]) if len(args) > 1 and args[1].isdigit() else DEFAULT_STEP
+        apply_system_volume(action, step)
+
+
+# ─── GUI Daemon ───────────────────────────────────────────────────────────────
+
+def run_daemon():
+    from PyQt5.QtWidgets import QApplication, QWidget
+    from PyQt5.QtCore import (
+        Qt, QTimer, QRectF, QPointF, QVariantAnimation, QEasingCurve,
+        pyqtSignal, QObject
+    )
+    from PyQt5.QtGui import (
+        QPainter, QColor, QBrush, QPen, QPainterPath, QLinearGradient,
+        QRadialGradient, QFont, QFontMetrics, QBitmap
+    )
+
+    if os.path.exists(SOCKET_PATH):
+        try:
+            test_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            test_sock.settimeout(0.2)
+            test_sock.connect(SOCKET_PATH)
+            test_sock.close()
+            print("Volume/Media OSD daemon is already running.")
+            return
+        except Exception:
+            try:
+                os.remove(SOCKET_PATH)
+            except OSError:
+                pass
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("VolumeMediaOSD")
+    app.setQuitOnLastWindowClosed(False)
+
+    class MediaHUD(QWidget):
+        sync_vol_signal = pyqtSignal(int, bool)
+        sync_media_signal = pyqtSignal(str, str, str)
+
+        def __init__(self):
+            super().__init__()
+            self.hud_width = 340
+            self.hud_height = 64
+            self.setFixedSize(self.hud_width, self.hud_height)
+
+            self.setWindowFlags(
+                Qt.FramelessWindowHint |
+                Qt.WindowStaysOnTopHint |
+                Qt.Tool |
+                Qt.WindowDoesNotAcceptFocus |
+                Qt.X11BypassWindowManagerHint
+            )
+            self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+            self.setAttribute(Qt.WA_TranslucentBackground, True)
+
+            self._apply_shape_mask()
+
+            # Mode: 'volume' or 'media'
+            self.mode = 'volume'
+
+            # Volume State
+            init_vol, init_muted = query_system_volume()
+            self.current_vol = float(init_vol)
+            self.target_vol = init_vol
+            self.is_muted = init_muted
+            self.icon_scale = 1.0
+            self.text_scale = 1.0
+            self.shake_offset = 0.0
+            self.kick_offset = 0.0
+
+            # Media State
+            self.media_action = 'paused' # 'playing', 'paused', 'next', 'prev'
+            self.media_state = 'paused'
+            self.media_title = ''
+            self.eq_phase = 0.0
+
+            # Animations
+            self.vol_anim = None
+            self.icon_anim = None
+            self.text_anim = None
+            self.shake_anim = None
+            self.slide_anim = None
+            self.opacity_anim = None
+            self.fadeout_anim = None
+
+            # Auto-hide timer
+            self.hide_timer = QTimer(self)
+            self.hide_timer.setSingleShot(True)
+            self.hide_timer.timeout.connect(self._start_fadeout)
+
+            # Equalizer animation timer
+            self.eq_timer = QTimer(self)
+            self.eq_timer.setInterval(33)
+            self.eq_timer.timeout.connect(self._tick_equalizer)
+
+            # Background worker thread
+            self.work_queue = queue.Queue()
+            self.sync_vol_signal.connect(self._on_sync_vol)
+            self.sync_media_signal.connect(self._on_sync_media)
+            self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+            self.worker_thread.start()
+
+            self._calculate_position()
+
+        def _apply_shape_mask(self):
+            path = QPainterPath()
+            path.addRoundedRect(QRectF(0, 0, self.hud_width, self.hud_height), 30, 30)
+            bitmap = QBitmap(self.hud_width, self.hud_height)
+            bitmap.fill(Qt.color0)
+            bp = QPainter(bitmap)
+            bp.setRenderHint(QPainter.Antialiasing)
+            bp.fillPath(path, Qt.color1)
+            bp.end()
+            self.setMask(bitmap)
+
+        def _calculate_position(self):
+            screen = QApplication.primaryScreen()
+            if screen:
+                geo = screen.geometry()
+                self.center_x = geo.x() + (geo.width() - self.hud_width) // 2
+                self.resting_y = geo.y() + 48
+            else:
+                self.center_x = (1366 - self.hud_width) // 2
+                self.resting_y = 48
+            self.move(self.center_x, self.resting_y)
+
+        def _tick_equalizer(self):
+            if self.mode == 'media' and self.media_state == 'playing' and self.isVisible():
+                self.eq_phase += 0.25
+                self.update()
+
+        def _worker_loop(self):
+            while True:
+                item = self.work_queue.get()
+                if item is None:
+                    break
+                task_type, action, arg = item
+
+                if task_type == 'volume':
+                    step = arg
+                    while not self.work_queue.empty():
+                        try:
+                            next_item = self.work_queue.get_nowait()
+                            if next_item[0] == 'volume' and next_item[1] == action and action in ('up', 'down'):
+                                step += next_item[2]
+                                self.work_queue.task_done()
+                            else:
+                                self.work_queue.put(next_item)
+                                break
+                        except queue.Empty:
+                            break
+
+                    actual_vol, actual_muted = apply_system_volume(action, step)
+                    self.sync_vol_signal.emit(actual_vol, actual_muted)
+
+                elif task_type == 'media':
+                    if action == 'toggle':
+                        st, title = toggle_media()
+                        self.sync_media_signal.emit(st, title, st)
+                    elif action in ('next', 'prev'):
+                        st, title = skip_media(forward=(action == 'next'))
+                        self.sync_media_signal.emit(st, title, action)
+
+                self.work_queue.task_done()
+
+        def _on_sync_vol(self, actual_vol: int, actual_muted: bool):
+            if abs(self.target_vol - actual_vol) > 1 or self.is_muted != actual_muted:
+                self.target_vol = actual_vol
+                self.is_muted = actual_muted
+                self._animate_volume(actual_vol)
+
+        def _on_sync_media(self, state: str, title: str, action: str):
+            self.media_state = state
+            self.media_action = action
+            if title:
+                self.media_title = title
+            if state == 'playing':
+                self.eq_timer.start()
+            else:
+                self.eq_timer.stop()
+            self.update()
+
+        def handle_command(self, cmd_line: str):
+            tokens = cmd_line.strip().split()
+            if not tokens:
+                action = "show"
+                step = DEFAULT_STEP
+            else:
+                action = tokens[0].lower()
+                step = int(tokens[1]) if len(tokens) > 1 and tokens[1].isdigit() else DEFAULT_STEP
+
+            if action in ('play-pause', 'play', 'pause', 'toggle-media', 'next', 'prev'):
+                self.mode = 'media'
+                if action in ('play-pause', 'play', 'pause', 'toggle-media'):
+                    cur_state, cur_title, _ = query_media_state()
+                    if cur_state == 'playing':
+                        next_state = 'paused'
+                    elif cur_state == 'paused':
+                        next_state = 'playing'
+                    else:
+                        next_state = 'paused' if self.media_state == 'playing' else 'playing'
+
+                    self.media_state = next_state
+                    self.media_action = next_state
+                    if cur_title:
+                        self.media_title = cur_title
+                    self.work_queue.put(('media', 'toggle', None))
+                    self._trigger_bounce(up=(next_state == 'playing'))
+                elif action == 'next':
+                    self.media_action = 'next'
+                    self.media_state = 'playing'
+                    self.work_queue.put(('media', 'next', None))
+                    self._trigger_kick(forward=True)
+                elif action == 'prev':
+                    self.media_action = 'prev'
+                    self.media_state = 'playing'
+                    self.work_queue.put(('media', 'prev', None))
+                    self._trigger_kick(forward=False)
+
+                if self.media_state == 'playing':
+                    self.eq_timer.start()
+                else:
+                    self.eq_timer.stop()
+
+            elif action == 'up':
+                self.mode = 'volume'
+                self.is_muted = False
+                self.target_vol = min(100, self.target_vol + step)
+                self.work_queue.put(('volume', 'up', step))
+                self._trigger_bounce(up=True)
+                self._animate_volume(self.target_vol)
+
+            elif action == 'down':
+                self.mode = 'volume'
+                self.target_vol = max(0, self.target_vol - step)
+                self.work_queue.put(('volume', 'down', step))
+                self._trigger_bounce(up=False)
+                self._animate_volume(self.target_vol)
+
+            elif action in ('mute', 'toggle'):
+                self.mode = 'volume'
+                self.is_muted = not self.is_muted
+                self.work_queue.put(('volume', 'mute', 0))
+                self._trigger_mute_shake()
+
+            elif action == 'set':
+                self.mode = 'volume'
+                self.is_muted = False
+                self.target_vol = max(0, min(100, step))
+                self.work_queue.put(('volume', 'set', self.target_vol))
+                self._animate_volume(self.target_vol)
+
+            elif action == 'show':
+                self.mode = 'volume'
+                vol, muted = query_system_volume()
+                self.target_vol = vol
+                self.is_muted = muted
+                self._animate_volume(vol)
+
+            elif action in ('quit', 'exit'):
+                self.work_queue.put(None)
+                QApplication.quit()
+                return
+
+            self._show_hud()
+
+        def _show_hud(self):
+            if self.fadeout_anim and self.fadeout_anim.state() == QVariantAnimation.Running:
+                self.fadeout_anim.stop()
+
+            self._calculate_position()
+
+            if not self.isVisible() or self.windowOpacity() < 0.95:
+                self.show()
+                self.raise_()
+
+                self.slide_anim = QVariantAnimation(self)
+                self.slide_anim.setDuration(140)
+                self.slide_anim.setStartValue(self.resting_y - 14)
+                self.slide_anim.setEndValue(self.resting_y)
+                self.slide_anim.setEasingCurve(QEasingCurve.OutCubic)
+                self.slide_anim.valueChanged.connect(lambda y: self.move(self.center_x, int(y)))
+                self.slide_anim.start()
+
+                self.opacity_anim = QVariantAnimation(self)
+                self.opacity_anim.setDuration(120)
+                self.opacity_anim.setStartValue(self.windowOpacity() if self.isVisible() else 0.0)
+                self.opacity_anim.setEndValue(1.0)
+                self.opacity_anim.setEasingCurve(QEasingCurve.OutCubic)
+                self.opacity_anim.valueChanged.connect(self.setWindowOpacity)
+                self.opacity_anim.start()
+            else:
+                self.setWindowOpacity(1.0)
+                self.move(self.center_x, self.resting_y)
+
+            self.hide_timer.start(1800)
+            self.update()
+
+        def _start_fadeout(self):
+            self.fadeout_anim = QVariantAnimation(self)
+            self.fadeout_anim.setDuration(220)
+            self.fadeout_anim.setStartValue(1.0)
+            self.fadeout_anim.setEndValue(0.0)
+            self.fadeout_anim.setEasingCurve(QEasingCurve.InCubic)
+            self.fadeout_anim.valueChanged.connect(self.setWindowOpacity)
+            self.fadeout_anim.finished.connect(self.hide)
+            self.fadeout_anim.start()
+
+        def _animate_volume(self, target: int):
+            if self.vol_anim and self.vol_anim.state() == QVariantAnimation.Running:
+                self.vol_anim.stop()
+
+            self.vol_anim = QVariantAnimation(self)
+            self.vol_anim.setDuration(160)
+            self.vol_anim.setStartValue(self.current_vol)
+            self.vol_anim.setEndValue(float(target))
+            self.vol_anim.setEasingCurve(QEasingCurve.OutCubic)
+
+            def update_vol(val):
+                self.current_vol = val
+                self.update()
+
+            self.vol_anim.valueChanged.connect(update_vol)
+            self.vol_anim.start()
+            self._trigger_text_pulse()
+
+        def _trigger_bounce(self, up=True):
+            if self.icon_anim and self.icon_anim.state() == QVariantAnimation.Running:
+                self.icon_anim.stop()
+
+            self.kick_offset = 0.0
+            self.icon_anim = QVariantAnimation(self)
+            self.icon_anim.setDuration(210)
+            self.icon_anim.setStartValue(1.28 if up else 0.82)
+            self.icon_anim.setEndValue(1.0)
+            self.icon_anim.setEasingCurve(QEasingCurve.OutBack)
+
+            def update_scale(s):
+                self.icon_scale = s
+                self.update()
+
+            self.icon_anim.valueChanged.connect(update_scale)
+            self.icon_anim.start()
+
+        def _trigger_kick(self, forward=True):
+            if self.icon_anim and self.icon_anim.state() == QVariantAnimation.Running:
+                self.icon_anim.stop()
+
+            self.icon_scale = 1.0
+            self.icon_anim = QVariantAnimation(self)
+            self.icon_anim.setDuration(220)
+            self.icon_anim.setStartValue(9.0 if forward else -9.0)
+            self.icon_anim.setEndValue(0.0)
+            self.icon_anim.setEasingCurve(QEasingCurve.OutBack)
+
+            def update_kick(val):
+                self.kick_offset = val
+                self.update()
+
+            self.icon_anim.valueChanged.connect(update_kick)
+            self.icon_anim.start()
+
+        def _trigger_text_pulse(self):
+            if self.text_anim and self.text_anim.state() == QVariantAnimation.Running:
+                self.text_anim.stop()
+
+            self.text_anim = QVariantAnimation(self)
+            self.text_anim.setDuration(170)
+            self.text_anim.setStartValue(1.16)
+            self.text_anim.setEndValue(1.0)
+            self.text_anim.setEasingCurve(QEasingCurve.OutQuad)
+
+            def update_text_scale(ts):
+                self.text_scale = ts
+                self.update()
+
+            self.text_anim.valueChanged.connect(update_text_scale)
+            self.text_anim.start()
+
+        def _trigger_mute_shake(self):
+            if self.shake_anim and self.shake_anim.state() == QVariantAnimation.Running:
+                self.shake_anim.stop()
+
+            self.shake_anim = QVariantAnimation(self)
+            self.shake_anim.setDuration(180)
+            self.shake_anim.setStartValue(0.0)
+            self.shake_anim.setEndValue(1.0)
+
+            def update_shake(progress):
+                if self.is_muted:
+                    self.shake_offset = math.sin(progress * math.pi * 3.0) * (4.0 * (1.0 - progress))
+                else:
+                    self.shake_offset = 0.0
+                self.update()
+
+            self.shake_anim.valueChanged.connect(update_shake)
+            self.shake_anim.start()
+            self._trigger_bounce(up=not self.is_muted)
+
+        def paintEvent(self, event):
+            p = QPainter(self)
+            p.setRenderHint(QPainter.Antialiasing)
+            p.setRenderHint(QPainter.TextAntialiasing)
+
+            w, h = self.hud_width, self.hud_height
+
+            # 1. Outer Capsule Pill Path
+            pill = QPainterPath()
+            pill.addRoundedRect(QRectF(1.0, 1.0, w - 2.0, h - 2.0), 30.0, 30.0)
+
+            # 2. Sleek Glassmorphic Background Fill
+            bg_grad = QLinearGradient(0, 0, 0, h)
+            bg_grad.setColorAt(0.0, QColor(22, 26, 35, 245))
+            bg_grad.setColorAt(1.0, QColor(14, 16, 22, 250))
+            p.fillPath(pill, bg_grad)
+
+            # 3. Ambient Bevel Border with Top Chamfer Highlight
+            border_grad = QLinearGradient(0, 0, 0, h)
+            border_grad.setColorAt(0.0, QColor(255, 255, 255, 55))
+            border_grad.setColorAt(0.4, QColor(255, 255, 255, 22))
+            border_grad.setColorAt(1.0, QColor(255, 255, 255, 12))
+            p.setPen(QPen(QBrush(border_grad), 1.4))
+            p.drawPath(pill)
+
+            if self.mode == 'volume':
+                self._paint_volume(p, w, h)
+            else:
+                self._paint_media(p, w, h)
+
+            p.end()
+
+        def _paint_volume(self, p: QPainter, w: int, h: int):
+            # Animated Speaker Icon
+            p.save()
+            icon_cx = 36.0 + self.shake_offset
+            icon_cy = 32.0
+            p.translate(icon_cx, icon_cy)
+            p.scale(self.icon_scale, self.icon_scale)
+
+            speaker_color = QColor('#ff4d6d') if self.is_muted else QColor('#00f2fe')
+
+            p.setPen(QPen(speaker_color, 2.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            p.setBrush(speaker_color)
+
+            cone = QPainterPath()
+            cone.moveTo(-11, -5)
+            cone.lineTo(-6, -5)
+            cone.lineTo(2, -10)
+            cone.lineTo(2, 10)
+            cone.lineTo(-6, 5)
+            cone.lineTo(-11, 5)
+            cone.closeSubpath()
+            p.drawPath(cone)
+
+            if self.is_muted:
+                p.setPen(QPen(QColor('#ff4d6d'), 2.6, Qt.SolidLine, Qt.RoundCap))
+                p.drawLine(QPointF(-10, -9), QPointF(14, 9))
+            else:
+                p.setBrush(Qt.NoBrush)
+                vol = self.current_vol
+                w1_c = speaker_color if vol > 0.5 else QColor(255, 255, 255, 28)
+                p.setPen(QPen(w1_c, 2.2, Qt.SolidLine, Qt.RoundCap))
+                p.drawArc(QRectF(-2, -6, 12, 12), -45 * 16, 90 * 16)
+
+                w2_c = speaker_color if vol > 33.0 else QColor(255, 255, 255, 28)
+                p.setPen(QPen(w2_c, 2.2, Qt.SolidLine, Qt.RoundCap))
+                p.drawArc(QRectF(-2, -11, 22, 22), -45 * 16, 90 * 16)
+
+                w3_c = speaker_color if vol > 66.0 else QColor(255, 255, 255, 28)
+                p.setPen(QPen(w3_c, 2.2, Qt.SolidLine, Qt.RoundCap))
+                p.drawArc(QRectF(-2, -16, 32, 32), -45 * 16, 90 * 16)
+
+            p.restore()
+
+            # Volume Slider Track
+            tx, ty, tw, th = 70.0, 26.0, 192.0, 12.0
+            track_rect = QRectF(tx, ty, tw, th)
+            track_path = QPainterPath()
+            track_path.addRoundedRect(track_rect, 6, 6)
+            p.fillPath(track_path, QColor(255, 255, 255, 22))
+            p.setPen(QPen(QColor(0, 0, 0, 50), 1.0))
+            p.drawPath(track_path)
+
+            # Fluid Animated Fill Bar
+            fill_pct = max(0.0, min(100.0, self.current_vol))
+            fill_w = tw * (fill_pct / 100.0)
+
+            if fill_w > 0.5:
+                fill_rect = QRectF(tx, ty, fill_w, th)
+                fill_path = QPainterPath()
+                fill_path.addRoundedRect(fill_rect, 6, 6)
+
+                fill_grad = QLinearGradient(tx, 0, tx + tw, 0)
+                if self.is_muted:
+                    fill_grad.setColorAt(0.0, QColor('#4b5563'))
+                    fill_grad.setColorAt(1.0, QColor('#6b7280'))
+                elif fill_pct <= 70.0:
+                    fill_grad.setColorAt(0.0, QColor('#00f2fe'))
+                    fill_grad.setColorAt(1.0, QColor('#4facfe'))
+                elif fill_pct <= 88.0:
+                    fill_grad.setColorAt(0.0, QColor('#00f2fe'))
+                    fill_grad.setColorAt(0.6, QColor('#818cf8'))
+                    fill_grad.setColorAt(1.0, QColor('#f59e0b'))
+                else:
+                    fill_grad.setColorAt(0.0, QColor('#f59e0b'))
+                    fill_grad.setColorAt(1.0, QColor('#ff0844'))
+
+                p.fillPath(fill_path, fill_grad)
+
+                # Glowing Thumb Indicator
+                if not self.is_muted and fill_w > 6:
+                    tip_x = tx + fill_w
+                    tip_y = ty + th / 2.0
+                    glow = QRadialGradient(tip_x, tip_y, 9)
+                    glow.setColorAt(0.0, QColor(255, 255, 255, 240))
+                    glow.setColorAt(0.4, QColor(79, 172, 254, 180))
+                    glow.setColorAt(1.0, QColor(79, 172, 254, 0))
+                    p.setPen(Qt.NoPen)
+                    p.setBrush(glow)
+                    p.drawEllipse(QPointF(tip_x, tip_y), 9, 9)
+
+            # Percentage / Muted Label with Scale Pulse
+            p.save()
+            text_cx = 295.0
+            text_cy = h / 2.0
+            p.translate(text_cx, text_cy)
+            p.scale(self.text_scale, self.text_scale)
+            p.translate(-text_cx, -text_cy)
+
+            p.setFont(QFont('DejaVu Sans', 11, QFont.Bold))
+            if self.is_muted:
+                p.setPen(QColor('#ff4d6d'))
+                p.drawText(QRectF(270, 0, 60, h), Qt.AlignVCenter | Qt.AlignLeft, 'MUTED')
+            else:
+                p.setPen(QColor('#f8fafc'))
+                p.drawText(QRectF(272, 0, 58, h), Qt.AlignVCenter | Qt.AlignLeft, f'{int(round(self.current_vol))}%')
+            p.restore()
+
+        def _paint_media(self, p: QPainter, w: int, h: int):
+            action = self.media_action
+
+            if action == 'next':
+                icon_color = QColor('#00f2fe') # Electric Cyan
+                status_text = "NEXT TRACK"
+            elif action == 'prev':
+                icon_color = QColor('#a78bfa') # Vibrant Violet
+                status_text = "PREVIOUS TRACK"
+            elif action == 'playing':
+                icon_color = QColor('#00f5a0') # Vibrant Emerald
+                status_text = "PLAYING"
+            else:
+                icon_color = QColor('#ff9f43') # Warm Amber
+                status_text = "PAUSED"
+
+            # 1. Media Vector Icon
+            p.save()
+            p.translate(38.0 + self.kick_offset, 32.0)
+            p.scale(self.icon_scale, self.icon_scale)
+            p.setPen(Qt.NoPen)
+            p.setBrush(icon_color)
+
+            if action == 'next':
+                # ⏭ Double Chevron + End Bar
+                t1 = QPainterPath()
+                t1.moveTo(-10, -9); t1.lineTo(0, 0); t1.lineTo(-10, 9); t1.closeSubpath()
+                p.drawPath(t1)
+                t2 = QPainterPath()
+                t2.moveTo(0, -9); t2.lineTo(10, 0); t2.lineTo(0, 9); t2.closeSubpath()
+                p.drawPath(t2)
+                p.drawRoundedRect(QRectF(11, -9, 3, 18), 1.5, 1.5)
+
+            elif action == 'prev':
+                # ⏮ Start Bar + Double Left Chevron
+                p.drawRoundedRect(QRectF(-14, -9, 3, 18), 1.5, 1.5)
+                t1 = QPainterPath()
+                t1.moveTo(0, -9); t1.lineTo(-10, 0); t1.lineTo(0, 9); t1.closeSubpath()
+                p.drawPath(t1)
+                t2 = QPainterPath()
+                t2.moveTo(10, -9); t2.lineTo(0, 0); t2.lineTo(10, 9); t2.closeSubpath()
+                p.drawPath(t2)
+
+            elif action == 'playing':
+                # ▶ Play Triangle
+                tri = QPainterPath()
+                tri.moveTo(-7, -11); tri.lineTo(10, 0); tri.lineTo(-7, 11); tri.closeSubpath()
+                p.drawPath(tri)
+
+            else:
+                # ❚❚ Pause Bars
+                p.drawRoundedRect(QRectF(-8, -10, 5, 20), 2.5, 2.5)
+                p.drawRoundedRect(QRectF(3, -10, 5, 20), 2.5, 2.5)
+
+            p.restore()
+
+            # 2. Status Title
+            p.setFont(QFont('DejaVu Sans', 11, QFont.Bold))
+            p.setPen(icon_color)
+            p.drawText(QRectF(68, 12, 220, 20), Qt.AlignLeft | Qt.AlignVCenter, status_text)
+
+            # 3. Track Subtitle (truncated with ellipsis if needed)
+            title_text = self.media_title or ("Media Player" if self.media_state == 'playing' else "Playback Paused")
+            p.setFont(QFont('DejaVu Sans', 9, QFont.Normal))
+            p.setPen(QColor('#94a3b8'))
+            fm = QFontMetrics(p.font())
+            elided = fm.elidedText(title_text, Qt.ElideRight, 215)
+            p.drawText(QRectF(68, 33, 220, 18), Qt.AlignLeft | Qt.AlignVCenter, elided)
+
+            # 4. Animated Equalizer Waveform on Right
+            p.save()
+            p.translate(w - 38.0, 32.0)
+            p.setPen(Qt.NoPen)
+            p.setBrush(icon_color)
+
+            if self.media_state == 'playing':
+                bars_h = [
+                    8.0 + 5.0 * math.sin(self.eq_phase * 1.8),
+                    14.0 + 7.0 * math.sin(self.eq_phase * 2.3 + 1.2),
+                    18.0 + 6.0 * math.sin(self.eq_phase * 1.5 + 2.4),
+                    10.0 + 6.0 * math.sin(self.eq_phase * 2.7 + 0.5)
+                ]
+            else:
+                bars_h = [5.0, 5.0, 5.0, 5.0]
+
+            for i, bh in enumerate(bars_h):
+                bx = (i - 1.5) * 6.0
+                p.drawRoundedRect(QRectF(bx, -bh / 2.0, 3.5, bh), 1.7, 1.7)
+            p.restore()
+
+    hud = MediaHUD()
+
+    server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        server_sock.bind(SOCKET_PATH)
+        server_sock.listen(16)
+        server_sock.setblocking(False)
+    except Exception as e:
+        print(f"Error binding socket {SOCKET_PATH}: {e}")
+        return
+
+    from PyQt5.QtCore import QSocketNotifier
+    notifier = QSocketNotifier(server_sock.fileno(), QSocketNotifier.Read, app)
+
+    def on_socket_ready():
+        while True:
+            try:
+                conn, _ = server_sock.accept()
+            except (BlockingIOError, InterruptedError):
+                break
+            except Exception:
+                break
+            try:
+                conn.settimeout(0.1)
+                data = conn.recv(512).decode('utf-8', errors='ignore')
+                conn.close()
+                if data:
+                    hud.handle_command(data.strip())
+            except Exception:
+                pass
+
+    notifier.activated.connect(on_socket_ready)
+
+    def cleanup():
+        try:
+            notifier.setEnabled(False)
+            server_sock.close()
+            if os.path.exists(SOCKET_PATH):
+                os.remove(SOCKET_PATH)
+        except Exception:
+            pass
+
+    app.aboutToQuit.connect(cleanup)
+
+    sys.exit(app.exec_())
+
+
+# ─── Entry Point ──────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--daemon":
+        run_daemon()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--test":
+        send_client_command("show")
+        time.sleep(0.4)
+        send_client_command("up 5")
+        time.sleep(0.3)
+        send_client_command("play-pause")
+        time.sleep(0.8)
+        send_client_command("next")
+        time.sleep(0.8)
+        send_client_command("prev")
+        time.sleep(0.8)
+        send_client_command("play-pause")
+    else:
+        run_client()
