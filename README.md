@@ -1,3 +1,7 @@
+![Screenshot](assets/1.png)
+![Screenshot](assets/2.png)
+![Screenshot](assets/3.png)
+---
 <p align="center">
   <img src="assets/banner.png" alt="Fluid Volume & Media OSD" width="100%">
 </p>
