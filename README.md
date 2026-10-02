@@ -2,9 +2,6 @@
 ![Screenshot](assets/2.png)
 ![Screenshot](assets/3.png)
 ---
-<p align="center">
-  <img src="assets/banner.png" alt="Fluid Volume & Media OSD" width="100%">
-</p>
 
 <p align="center">
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.8+-3776AB?style=flat&logo=python&logoColor=white" alt="Python 3.8+"></a>
